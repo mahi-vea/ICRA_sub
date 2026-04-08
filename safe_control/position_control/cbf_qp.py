@@ -27,7 +27,7 @@ class CBFQP:
         elif self.robot_spec['model'] == 'KinematicBicycle2D_DPCBF':
             self.cbf_param['alpha'] = 1.5
         elif self.robot_spec['model'] == 'DynamicUnicycle2D_DPCBF':
-            self.cbf_param['alpha'] = 10
+            self.cbf_param['alpha'] = 10.0
         elif self.robot_spec['model'] == 'Quad2D':
             self.cbf_param['alpha1'] = 1.5
             self.cbf_param['alpha2'] = 1.5
