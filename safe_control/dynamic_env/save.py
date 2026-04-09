@@ -707,3 +707,5 @@ if __name__ == '__main__':
     try:
         node = CBFQPRosNode()
         rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
