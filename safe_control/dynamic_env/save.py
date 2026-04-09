@@ -104,7 +104,7 @@ class CBFQPRosNode:
         # Mode-dependent defaults
         # ------------------------------------------------------------------
         if self.environment_mode == 'static':
-            default_goal    = [0.0, -10.0]
+            default_goal    = [10.0, 0.0]
             default_dt      = 0.01
             default_obs_r   = 0.01
             default_v_max   = 2.5
