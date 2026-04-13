@@ -1,59 +1,4 @@
 #!/usr/bin/env python3
-"""
-cbf_qp_ros_node.py
-==================
-Unified ROS 1 node that ports the LocalTrackingControllerDyn obstacle-avoidance
-logic to a real robot / Gazebo simulation.
-
-Automatically selects **static** or **dynamic** environment mode:
-  - static  (init_position == [-2, 3, 1.57]):  Uses VFH* for local heading
-    selection from LIDAR, producing a short-range waypoint for the CBF-QP
-    controller.
-  - dynamic (any other init_position):  Uses tracked-object detections
-    (with velocities) merged with LIDAR static obstacles; drives directly
-    toward the goal with CBF-QP safety filtering.
-
-Subscribes
-----------
-/front/scan           (sensor_msgs/LaserScan)
-    LIDAR scan — used in both modes for static obstacle extraction.
-    In static mode also feeds the VFH* heading selector.
-
-/odometry/filtered    (nav_msgs/Odometry)
-    Robot state — x, y, yaw, v (linear), omega (angular).
-    Assumed to start at (0, 0, 0) in the odom frame.
-
-/tracked_objects      (std_msgs/Float32MultiArray)   [dynamic mode only]
-    Flat array: [id, x, y, vx, vy,  id, x, y, vx, vy, ...]
-    Positions in base_link frame; transformed to world frame internally.
-
-Publishes
----------
-/cmd_vel              (geometry_msgs/Twist)
-
-Parameters (rosparam)
----------------------
-~init_position   : [x, y, theta]   default [-2, 3, 1.57]
-~goal_position   : [x, y]          default [10, 0]  (RELATIVE to init, in robot's
-                                    initial heading frame — i.e. "10m forward")
-~goal_theta      : float           default 0.0  (desired final heading in world, rad)
-~heading_tolerance : float         default 0.15 (~8.6 degrees)
-~controller_type : str             default 'cbf_qp'
-                                   options: cbf_qp | optimal_decay_cbf_qp | mpc_cbf
-~dt              : float            default 0.01  (static) / 0.005 (dynamic)
-~obs_radius      : float            default 0.01  (static) / 0.1   (dynamic)
-~robot_radius    : float            default 0.25
-~v_max           : float            default 1.5   (static) / 7.5   (dynamic)
-~w_max           : float            default 1.0   (static) / 5.0   (dynamic)
-~a_max           : float            default 0.5   (static) / 7.5   (dynamic)
-~num_constraints : int              default 15    (static) / 5     (dynamic)
-~goal_tolerance  : float            default 0.5
-~waypoint_dist   : float            default 2.0   (VFH* lookahead, static only)
-~reverse_speed   : float            default 0.3   (reverse speed on infeasible)
-~reverse_duration: float            default 1.0   (seconds to reverse)
-~reverse_omega   : float            default 0.5   (turn rate while reversing)
-~rotate_k_omega  : float            default 2.0   (P-gain for rotate-in-place)
-"""
 
 import math
 import threading
@@ -68,6 +13,7 @@ from nav_msgs.msg      import Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg   import LaserScan
 
+from geometry_msgs.msg import Pose2D
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -104,7 +50,7 @@ class CBFQPRosNode:
         # Mode-dependent defaults
         # ------------------------------------------------------------------
         if self.environment_mode == 'static':
-            default_goal    = [10.0, 0.0]
+            default_goal    = [0.0, -10.0]
             default_dt      = 0.01
             default_obs_r   = 0.01
             default_v_max   = 2.5
@@ -215,6 +161,16 @@ class CBFQPRosNode:
         self.current_heading  = math.degrees(theta0)   # degrees, for VFH*
         self.current_yaw      = theta0                  # radians
         self.odom_received    = False
+        self.pose2d_received = False
+
+        self._prev_odom_x   = None
+        self._prev_odom_y   = None
+        self._prev_odom_yaw = None
+
+        self._scan_matcher_active  = False
+        self._last_pose2d_time     = None
+        self._pose2d_timeout       = rospy.get_param('~pose2d_timeout', 1.0)  # seconds
+        self._max_correction_jump  = rospy.get_param('~max_correction_jump', 0.5)  # metres
 
         # ------------------------------------------------------------------
         # State machine: 'navigate' -> 'rotate' -> 'done'
@@ -268,6 +224,7 @@ class CBFQPRosNode:
                          self._odom_cb, queue_size=1)
         rospy.Subscriber('front/scan', LaserScan,
                          self._scan_cb, queue_size=1)
+        rospy.Subscriber('/pose2D', Pose2D, self._pose2d_cb, queue_size=1)
 
         # Dynamic-only subscriber
         if self.environment_mode == 'dynamic':
@@ -292,30 +249,96 @@ class CBFQPRosNode:
     # ===================================================================
 
     def _odom_cb(self, msg: Odometry):
-        x = msg.pose.pose.position.x + self.init_pos[0]
-        y = msg.pose.pose.position.y + self.init_pos[1]
+        """
+        When scan matcher is active: extract velocity + use odom *delta*
+        to propagate the scan-matcher-corrected pose forward between corrections.
+        When scan matcher is silent: use odom absolute pose directly (fallback).
+        """
+        x_raw = msg.pose.pose.position.x + self.init_pos[0]
+        y_raw = msg.pose.pose.position.y + self.init_pos[1]
 
         ori = msg.pose.pose.orientation
         q_ros = [ori.w, ori.x, ori.y, ori.z]
-        _, _, yaw_rad = t3d_euler.quat2euler(q_ros, axes='sxyz')
-
-        # Normalise yaw to [-pi, pi]
-        yaw = normalize_angle(yaw_rad)
+        _, _, yaw_raw = t3d_euler.quat2euler(q_ros, axes='sxyz')
+        yaw_raw = normalize_angle(yaw_raw)
 
         lin = msg.twist.twist.linear
         v   = np.hypot(lin.x, lin.y)
+        self.robot.X[3, 0] = v   # velocity always comes from odom
 
-        self.robot.X[0, 0] = x
-        self.robot.X[1, 0] = y
-        self.robot.X[2, 0] = yaw
-        self.robot.X[3, 0] = v
-        self.current_position = (x, y)
-        self.current_yaw      = yaw                        # radians
-        self.current_heading  = math.degrees(yaw)           # degrees for VFH*
-        self.odom_received    = True
+        if self._scan_matcher_active:
+            # Compute how much odom moved since last tick, apply that delta
+            # to whatever pose scan matcher last gave us.
+            # if hasattr(self, '_prev_odom_x'):
+            if self._prev_odom_x is not None:
+                dx      = x_raw   - self._prev_odom_x
+                dy      = y_raw   - self._prev_odom_y
+                dtheta  = normalize_angle(yaw_raw - self._prev_odom_yaw)
 
-        rospy.loginfo_throttle(1.0,
-            f"[ODOM] x={x:.2f} y={y:.2f} yaw={yaw:.3f} v={v:.3f}")
+                self.robot.X[0, 0] += dx
+                self.robot.X[1, 0] += dy
+                self.robot.X[2, 0]  = normalize_angle(self.robot.X[2, 0] + dtheta)
+
+                self.current_position = (float(self.robot.X[0, 0]),
+                                        float(self.robot.X[1, 0]))
+                self.current_yaw      = float(self.robot.X[2, 0])
+                self.current_heading  = math.degrees(self.current_yaw)
+
+        else:
+            # Scan matcher offline — trust odom absolute pose directly
+            self.robot.X[0, 0] = x_raw
+            self.robot.X[1, 0] = y_raw
+            self.robot.X[2, 0] = yaw_raw
+
+            self.current_position = (x_raw, y_raw)
+            self.current_yaw      = yaw_raw
+            self.current_heading  = math.degrees(yaw_raw)
+
+        # Store for next delta computation
+        self._prev_odom_x   = x_raw
+        self._prev_odom_y   = y_raw
+        self._prev_odom_yaw = yaw_raw
+
+        self.odom_received = True
+    
+    def _pose2d_cb(self, msg):
+        """
+        Scan matcher is the ground truth for x, y, theta.
+        Snap robot.X to it; odom will propagate deltas until next correction.
+        """
+        now = rospy.Time.now()
+        self._last_pose2d_time = now
+        self.pose2d_received   = True
+
+        sm_x   = msg.x + self.init_pos[0]
+        sm_y   = msg.y + self.init_pos[1]
+        sm_yaw = normalize_angle(msg.theta)
+
+        # Reject implausible jumps (scan matcher glitch on sparse returns)
+        dx   = sm_x - self.robot.X[0, 0]
+        dy   = sm_y - self.robot.X[1, 0]
+        jump = math.hypot(dx, dy)
+
+        if jump > self._max_correction_jump:
+            rospy.logwarn_throttle(1.0,
+                f"[POSE2D] Rejected jump={jump:.3f} m — keeping current pose")
+            return
+
+        # Snap pose — velocity untouched
+        self.robot.X[0, 0] = sm_x
+        self.robot.X[1, 0] = sm_y
+        self.robot.X[2, 0] = sm_yaw
+
+        self.current_position = (sm_x, sm_y)
+        self.current_yaw      = sm_yaw
+        self.current_heading  = math.degrees(sm_yaw)
+
+        if not self._scan_matcher_active:
+            rospy.loginfo("[POSE2D] Scan matcher active — now authoritative for pose")
+            self._scan_matcher_active = True
+
+        rospy.logdebug_throttle(1.0,
+            f"[POSE2D] snap x={sm_x:.2f} y={sm_y:.2f} yaw={sm_yaw:.3f} jump={jump:.3f}m")
 
     def _scan_cb(self, msg: LaserScan):
         """
@@ -551,6 +574,22 @@ class CBFQPRosNode:
     # ===================================================================
 
     def _control_loop(self, event):
+        # if not self.odom_received:
+        #     rospy.logwarn_throttle(2.0, "[cbf_qp_node] Waiting for odometry...")
+        #     return
+        # if not self.pose2d_received:
+        #     rospy.logwarn_throttle(2.0, "[cbf_qp_node] Waiting for /pose2D...")
+        #     return
+
+        # # Scan matcher staleness check
+        # if self._last_pose2d_time is not None:
+        #     age = (rospy.Time.now() - self._last_pose2d_time).to_sec()
+        #     if age > self._pose2d_timeout and self._scan_matcher_active:
+        #         rospy.logwarn_throttle(2.0,
+        #             f"[cbf_qp_node] /pose2D silent for {age:.1f}s "
+        #             f"— falling back to odometry only")
+        #         self._scan_matcher_active = False
+
         if not self.odom_received:
             rospy.logwarn_throttle(2.0, "[cbf_qp_node] Waiting for odometry...")
             return
